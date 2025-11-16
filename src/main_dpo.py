@@ -11,8 +11,11 @@ from datasets import load_dataset
 import torch
 from torch import nn
 
-from dpo import DPOCollator, DPOTrainer
-from lora import LoRALayer
+from .dpo import DPOCollator, DPOTrainer
+from .lora import LoRALayer
+
+
+torch.set_float32_matmul_precision('medium')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,32 +23,54 @@ logger = logging.getLogger(__name__)
 # Configuration
 MODEL = 'EleutherAI/pythia-1.4b'
 
+
+NUM_PROC = 12
 SFT_CHECKPOINT_PATH = "/home/user/Desktop/NLP/hw4/sft.pt"
 TRAIN_DATASET_PATH = "/home/user/Desktop/NLP/hw4/train_dataset"
 EVAL_DATASET_PATH = "/home/user/Desktop/NLP/hw4/eval_dataset"
 OUTPUT_DIR = "/home/user/Desktop/NLP/hw4/dpo_output"
 
 RANK = 32
-TRAIN_SUBSET_SIZE = 2000
-EVAL_SUBSET_SIZE  = 100
+TRAIN_SUBSET_SIZE = 10_000
+EVAL_SUBSET_SIZE  = 500
 MAX_LEN = 360
-
-# Load datasets
-logger.info("Loading datasets...")
-dataset = load_dataset('Anthropic/hh-rlhf')
-logger.info(f"Dataser:\n{dataset}")
-
-dpo_train_dataset = dataset["train"].select(range(TRAIN_SUBSET_SIZE))
-dpo_eval_dataset = dataset["test"].select(range(EVAL_SUBSET_SIZE))
 
 # Load tokenizer
 logger.info("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
+# Load datasets
+logger.info("Loading datasets...")
+dataset = load_dataset('Anthropic/hh-rlhf')
+logger.info(f"Dataser:\n{dataset}")
+
+
+def is_within_max_len(example):
+    chosen_tokens = tokenizer(example["chosen"], truncation=False)['input_ids']
+    rejected_tokens = tokenizer(example["rejected"], truncation=False)['input_ids']
+    return len(chosen_tokens) <= MAX_LEN and len(rejected_tokens) <= MAX_LEN
+
+
+dpo_train = dataset["train"].filter(is_within_max_len, num_proc=NUM_PROC)
+dpo_test = dataset["test"].filter(is_within_max_len, num_proc=NUM_PROC)
+
+logger.info(f"Original training dataset size: {len(dataset['train'])}")
+logger.info(f"Filtered training dataset size: {len(dpo_train)}")
+
+logger.info(f"Original evaluation dataset size: {len(dataset['test'])}")
+logger.info(f"Filtered evaluation dataset size: {len(dpo_test)}")
+
+dpo_train_dataset = dpo_train.select(range(TRAIN_SUBSET_SIZE))
+dpo_eval_dataset = dpo_test.select(range(EVAL_SUBSET_SIZE))
+
+dpo_train_dataset.save_to_disk(TRAIN_DATASET_PATH)
+dpo_eval_dataset.save_to_disk(EVAL_DATASET_PATH)
+
 # Load base model for policy
 logger.info("Loading policy model...")
-policy_model = AutoModelForCausalLM.from_pretrained(MODEL)
+policy_model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="flash_attention_2")
+
 policy_model.resize_token_embeddings(len(tokenizer))
 
 # Freeze base model
@@ -89,10 +114,10 @@ RUN_NAME = "dpo-v1.0"
 LOGGING_DIR = f"{OUTPUT_DIR}/logs/{RUN_NAME}"
 
 # --- Core Training Hyperparameters ---
-LEARNING_RATE = 5e-5
-PER_DEVICE_TRAIN_BATCH_SIZE = 4
-PER_DEVICE_EVAL_BATCH_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 2  # effective batch size = 8
+LEARNING_RATE = 2e-5
+PER_DEVICE_TRAIN_BATCH_SIZE = 2
+PER_DEVICE_EVAL_BATCH_SIZE = 4
+GRADIENT_ACCUMULATION_STEPS = 2  # effective batch size = 4
 NUM_TRAIN_EPOCHS = 1
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
@@ -101,7 +126,7 @@ SCHEDULER_TYPE = "reduce_lr_on_plateau"
 SCHEDULER_KWARGS = {
     "mode": "min",
     "factor": 0.5,
-    "patience": 1,
+    "patience": 3,
 }
 
 # --- Evaluation, Saving, & Logging ---
@@ -154,17 +179,17 @@ training_args = TrainingArguments(
     greater_is_better=True,
 
     fp16=True,
-    torch_compile=True,
-    torch_compile_backend="inductor",
-    torch_compile_mode="default",
+    # torch_compile=True,
+    # torch_compile_backend="inductor",
+    # torch_compile_mode="default",
 )
 
 data_collator = DPOCollator(tokenizer=tokenizer, max_length=MAX_LEN)
 
 dpo_trainer = DPOTrainer(
-    beta=0.1,
+    beta=0.2,
     model=policy_model,
-    ref_model=ref_model,
+    model_ref=ref_model,
 
     args=training_args,
 
