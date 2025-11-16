@@ -11,8 +11,8 @@ from datasets import load_dataset
 import torch
 from torch import nn
 
-from .dpo import DPOCollator, DPOTrainer
-from .lora import LoRALayer
+from dpo import DPOCollator, DPOTrainer
+from lora import LoRALayer
 
 
 torch.set_float32_matmul_precision('medium')
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 MODEL = 'EleutherAI/pythia-1.4b'
 
 
-NUM_PROC = 12
+NUM_PROC = 8
 SFT_CHECKPOINT_PATH = "/home/user/Desktop/NLP/hw4/sft.pt"
 TRAIN_DATASET_PATH = "/home/user/Desktop/NLP/hw4/train_dataset"
 EVAL_DATASET_PATH = "/home/user/Desktop/NLP/hw4/eval_dataset"
@@ -51,15 +51,16 @@ def is_within_max_len(example):
     rejected_tokens = tokenizer(example["rejected"], truncation=False)['input_ids']
     return len(chosen_tokens) <= MAX_LEN and len(rejected_tokens) <= MAX_LEN
 
+# dpo_train = dataset["train"].filter(is_within_max_len, num_proc=NUM_PROC)
+# dpo_test = dataset["test"].filter(is_within_max_len, num_proc=NUM_PROC)
+dpo_train = dataset["train"]
+dpo_test = dataset["test"]
 
-dpo_train = dataset["train"].filter(is_within_max_len, num_proc=NUM_PROC)
-dpo_test = dataset["test"].filter(is_within_max_len, num_proc=NUM_PROC)
+# logger.info(f"Original training dataset size: {len(dataset['train'])}")
+# logger.info(f"Filtered training dataset size: {len(dpo_train)}")
 
-logger.info(f"Original training dataset size: {len(dataset['train'])}")
-logger.info(f"Filtered training dataset size: {len(dpo_train)}")
-
-logger.info(f"Original evaluation dataset size: {len(dataset['test'])}")
-logger.info(f"Filtered evaluation dataset size: {len(dpo_test)}")
+# logger.info(f"Original evaluation dataset size: {len(dataset['test'])}")
+# logger.info(f"Filtered evaluation dataset size: {len(dpo_test)}")
 
 dpo_train_dataset = dpo_train.select(range(TRAIN_SUBSET_SIZE))
 dpo_eval_dataset = dpo_test.select(range(EVAL_SUBSET_SIZE))
@@ -69,7 +70,7 @@ dpo_eval_dataset.save_to_disk(EVAL_DATASET_PATH)
 
 # Load base model for policy
 logger.info("Loading policy model...")
-policy_model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="flash_attention_2")
+policy_model = AutoModelForCausalLM.from_pretrained(MODEL)
 
 policy_model.resize_token_embeddings(len(tokenizer))
 
@@ -189,7 +190,7 @@ data_collator = DPOCollator(tokenizer=tokenizer, max_length=MAX_LEN)
 dpo_trainer = DPOTrainer(
     beta=0.2,
     model=policy_model,
-    model_ref=ref_model,
+    ref_model=ref_model,
 
     args=training_args,
 
