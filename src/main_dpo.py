@@ -1,59 +1,177 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from safetensors.torch import load_file
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments
+)
+
+import logging
+import copy
+from datasets import load_dataset
+
 import torch
 from torch import nn
-import pathlib
-import datasets
 
-from lora import LoRALayer  # TODO fix
+from dpo import DPOCollator, DPOTrainer
+from lora import LoRALayer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration
+MODEL = 'EleutherAI/pythia-1.4b'
+
+SFT_CHECKPOINT_PATH = "/home/user/Desktop/NLP/hw4/sft.pt"
+TRAIN_DATASET_PATH = "/home/user/Desktop/NLP/hw4/train_dataset"
+EVAL_DATASET_PATH = "/home/user/Desktop/NLP/hw4/eval_dataset"
+OUTPUT_DIR = "/home/user/Desktop/NLP/hw4/dpo_output"
 
 RANK = 32
-MODEL = 'EleutherAI/pythia-1.4b'
-CHECKPOINT_PATH = "/home/user/Desktop/NLP/hw4/sft.pt"
+TRAIN_SUBSET_SIZE = 2000
+EVAL_SUBSET_SIZE  = 100
+MAX_LEN = 360
 
-TRAIN_DATASET_PATH = "/home/user/Desktop/NLP/hw4/trainset"
-EVAL_DATASET_PATH = "/home/user/Desktop/NLP/hw4/evalset"
+# Load datasets
+logger.info("Loading datasets...")
+dataset = load_dataset('Anthropic/hh-rlhf')
+logger.info(f"Dataser:\n{dataset}")
 
-assert pathlib.Path(CHECKPOINT_PATH).exists()
+dpo_train_dataset = dataset["train"].select(range(TRAIN_SUBSET_SIZE))
+dpo_eval_dataset = dataset["test"].select(range(EVAL_SUBSET_SIZE))
 
-trainset = datasets.load_from_disk(TRAIN_DATASET_PATH)
-evalset = datasets.load_from_disk(EVAL_DATASET_PATH)
-print("Datasets loaded successfully.")
-
+# Load tokenizer
+logger.info("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
-model = AutoModelForCausalLM.from_pretrained(MODEL)
-
 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-model.resize_token_embeddings(len(tokenizer))
 
-print("Tokenizer loaded successfully.")
+# Load base model for policy
+logger.info("Loading policy model...")
+policy_model = AutoModelForCausalLM.from_pretrained(MODEL)
+policy_model.resize_token_embeddings(len(tokenizer))
 
-for param in model.parameters():
+# Freeze base model
+for param in policy_model.parameters():
     param.requires_grad = False
 
+# Add LoRA layers
 modules_to_replace = []
-for name, module in model.named_modules():
+for name, module in policy_model.named_modules():
     if isinstance(module, nn.Linear) and (name.endswith('dense') or name.endswith('query_key_value')):
         modules_to_replace.append(name)
 
 for name in modules_to_replace:
     parent_name = ".".join(name.split('.')[:-1])
     child_name = name.split('.')[-1]
-    parent_module = model.get_submodule(parent_name)
+    parent_module = policy_model.get_submodule(parent_name)
     target_module = getattr(parent_module, child_name)
 
     lora_layer = LoRALayer(target_module, RANK)
     setattr(parent_module, child_name, lora_layer)
-    print(f"Replaced {name} with LoRALayer")
+    # logger.info(f"Replaced {name} with LoRALayer")
 
-state = torch.load(CHECKPOINT_PATH, map_location="cpu")
-missing, unexpected = model.load_state_dict(state, strict=False)
-print("Missing keys:", missing)
-print("Unexpected keys:", unexpected)
+# Load SFT checkpoint
+logger.info(f"Loading SFT checkpoint from {SFT_CHECKPOINT_PATH}")
+state = torch.load(SFT_CHECKPOINT_PATH, map_location="cpu")
+missing, unexpected = policy_model.load_state_dict(state, strict=False)
+logger.info(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
 
-model.to("cuda:0").eval()
+# Create reference model (frozen copy of SFT model)
+logger.info("Creating reference model...")
 
-print(model)
-print("Model loaded successfully.")
+policy_model.to("cuda:0")
+ref_model = copy.deepcopy(policy_model).to("cuda:0")
+ref_model.eval()
+for param in ref_model.parameters():
+    param.requires_grad = False
 
-# TODO: here will be dpo code
+# --- Directory & Logging Constants ---
+OUTPUT_DIR = "./dpo"
+RUN_NAME = "dpo-v1.0"
+LOGGING_DIR = f"{OUTPUT_DIR}/logs/{RUN_NAME}"
+
+# --- Core Training Hyperparameters ---
+LEARNING_RATE = 5e-5
+PER_DEVICE_TRAIN_BATCH_SIZE = 4
+PER_DEVICE_EVAL_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION_STEPS = 2  # effective batch size = 8
+NUM_TRAIN_EPOCHS = 1
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.1
+
+SCHEDULER_TYPE = "reduce_lr_on_plateau"
+SCHEDULER_KWARGS = {
+    "mode": "min",
+    "factor": 0.5,
+    "patience": 1,
+}
+
+# --- Evaluation, Saving, & Logging ---
+EVAL_STEPS = 50
+EVAL_ON_START = True
+SAVE_STEPS = 100
+LOGGING_STEPS = 2
+SAVE_TOTAL_LIMIT = 1
+METRIC_FOR_BEST_MODEL = "accuracy"
+REPORT_TO = "tensorboard"
+
+# --- Strategy ---
+LOGGING_STRATEGY = "steps"
+EVALUATION_STRATEGY = "steps"
+SAVE_STRATEGY = "steps"
+
+training_args = TrainingArguments(
+    num_train_epochs=NUM_TRAIN_EPOCHS,
+    per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+    per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
+
+    output_dir=OUTPUT_DIR,
+    learning_rate=LEARNING_RATE,
+
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+    weight_decay=WEIGHT_DECAY,
+    warmup_ratio=WARMUP_RATIO,
+
+    lr_scheduler_type=SCHEDULER_TYPE,
+    lr_scheduler_kwargs=SCHEDULER_KWARGS,
+
+    run_name=RUN_NAME,
+    report_to=REPORT_TO,
+
+    remove_unused_columns=False,
+
+    logging_dir=LOGGING_DIR,
+    logging_strategy=LOGGING_STRATEGY,
+    logging_steps=LOGGING_STEPS,
+
+    save_steps=SAVE_STEPS,
+    save_strategy=SAVE_STRATEGY,
+    save_total_limit=SAVE_TOTAL_LIMIT,
+    load_best_model_at_end=True,
+
+    eval_steps=EVAL_STEPS,
+    eval_strategy=EVALUATION_STRATEGY,
+    eval_on_start=EVAL_ON_START,
+    metric_for_best_model=METRIC_FOR_BEST_MODEL,
+    greater_is_better=True,
+
+    fp16=True,
+    torch_compile=True,
+    torch_compile_backend="inductor",
+    torch_compile_mode="default",
+)
+
+data_collator = DPOCollator(tokenizer=tokenizer, max_length=MAX_LEN)
+
+dpo_trainer = DPOTrainer(
+    beta=0.1,
+    model=policy_model,
+    ref_model=ref_model,
+
+    args=training_args,
+
+    train_dataset=dpo_train_dataset,
+    eval_dataset=dpo_eval_dataset,
+    data_collator=data_collator,
+)
+
+dpo_trainer.train()
+dpo_trainer.save_model(OUTPUT_DIR)
