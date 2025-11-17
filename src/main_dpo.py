@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 # Configuration
 MODEL = 'EleutherAI/pythia-1.4b'
 
-
 NUM_PROC = 8
 SFT_CHECKPOINT_PATH = "/home/user/Desktop/NLP/hw4/sft.pt"
 TRAIN_DATASET_PATH = "/home/user/Desktop/NLP/hw4/train_dataset"
@@ -31,8 +30,8 @@ EVAL_DATASET_PATH = "/home/user/Desktop/NLP/hw4/eval_dataset"
 OUTPUT_DIR = "/home/user/Desktop/NLP/hw4/dpo_output"
 
 RANK = 32
-TRAIN_SUBSET_SIZE = 10_000
-EVAL_SUBSET_SIZE  = 500
+TRAIN_SUBSET_SIZE = 1_000 # for testing only
+EVAL_SUBSET_SIZE  = 100
 MAX_LEN = 360
 
 # Load tokenizer
